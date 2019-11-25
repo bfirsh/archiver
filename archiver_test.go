@@ -3,6 +3,7 @@ package archiver
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -322,7 +323,7 @@ func testArchiveUnarchive(t *testing.T, au archiverUnarchiver) {
 
 	// Test extracting archive
 	dest := filepath.Join(tmp, "extraction_test_"+auStr)
-	_ = os.Mkdir(dest, 0755)
+	os.Mkdir(dest, 0755)
 	err = au.Unarchive(outfile, dest)
 	if err != nil {
 		t.Fatalf("[%s] extracting archive [%s -> %s]: didn't expect an error, but got: %v", auStr, outfile, dest, err)
@@ -331,24 +332,32 @@ func testArchiveUnarchive(t *testing.T, au archiverUnarchiver) {
 	// Check that what was extracted is what was compressed
 	symmetricTest(t, auStr, dest, true, true)
 
-	// Read outfile bytes and create a reader
-	inMemoryBytes, err := ioutil.ReadFile(outfile)
+	// Test writing archive to in-memory bytes and then writing those
+	bytesBuf := &bytes.Buffer{}
+	err = au.WriterArchive([]string{"testdata/corpus"}, bytesBuf)
 	if err != nil {
-		t.Fatalf("failed to read in outfile bytes")
+		t.Fatalf("[%s] making archive: didn't expect an error, but got: %v", auStr, err)
 	}
-	reader := bytes.NewReader(inMemoryBytes)
 
-	readerDest := filepath.Join(tmp, "extraction_test_reader"+auStr)
-	os.Mkdir(readerDest, 0755)
-	err = au.ReaderUnarchive(reader, int64(len(inMemoryBytes)), readerDest)
+	// write in-memory bytes to file
+	bytesOutFile := filepath.Join(tmp, "archiver_test_bytes."+auStr)
+	err = ioutil.WriteFile(bytesOutFile, bytesBuf.Bytes(), 0644)
 	if err != nil {
-		t.Fatalf("[%s] extracting archive [reader -> %s]: didn't expect an error, but got: %v", auStr, readerDest, err)
+		t.Fatalf("[%s] writing in-memory bytes to output file %s", auStr, bytesOutFile)
 	}
-	// Check that what was extracted from reader is what was compressed
-	symmetricTest(t, auStr, readerDest, true, true)
+
+	// Test extracting archive
+	bytesDest := filepath.Join(tmp, "extraction_test_bytes_"+auStr)
+	os.Mkdir(bytesDest, 0755)
+	err = au.Unarchive(bytesOutFile, bytesDest)
+	if err != nil {
+		t.Fatalf("[%s] extracting archive [%s -> %s]: didn't expect an error, but got: %v", auStr, bytesOutFile, bytesDest, err)
+	}
+
+	// Check that what was extracted is what was compressed
+	symmetricTest(t, auStr, bytesDest, true, true)
 }
 
-/*
 // testMatching tests that au can match the format of archiveFile.
 func testMatching(t *testing.T, au archiverUnarchiver, archiveFile string) {
 	m, ok := au.(Matcher)
@@ -374,13 +383,12 @@ func testMatching(t *testing.T, au archiverUnarchiver, archiveFile string) {
 		t.Fatalf("%s (%T): format should have matched, but didn't", m, m)
 	}
 }
-*/
 
 // symmetricTest compares the contents of a destination directory to the contents
 // of the test corpus and tests that they are equal.
 func symmetricTest(t *testing.T, formatName, dest string, testSymlinks, testModes bool) {
 	var expectedFileCount int
-	_ = filepath.Walk("testdata/corpus", func(fpath string, info os.FileInfo, err error) error {
+	filepath.Walk("testdata/corpus", func(fpath string, info os.FileInfo, err error) error {
 		if testSymlinks || (info.Mode()&os.ModeSymlink) == 0 {
 			expectedFileCount++
 		}
@@ -390,7 +398,7 @@ func symmetricTest(t *testing.T, formatName, dest string, testSymlinks, testMode
 	// If outputs equals inputs, we're good; traverse output files
 	// and compare file names, file contents, and file count.
 	var actualFileCount int
-	_ = filepath.Walk(dest, func(fpath string, info os.FileInfo, _ error) error {
+	filepath.Walk(dest, func(fpath string, info os.FileInfo, err error) error {
 		if fpath == dest {
 			return nil
 		}
@@ -468,111 +476,6 @@ func symmetricTest(t *testing.T, formatName, dest string, testSymlinks, testMode
 	}
 }
 
-func TestUnarchiveWithStripComponents(t *testing.T) {
-	testArchives := []string{
-		"testdata/sample.rar",
-		"testdata/testarchives/evilarchives/evil.zip",
-		"testdata/testarchives/evilarchives/evil.tar",
-		"testdata/testarchives/evilarchives/evil.tar.gz",
-		"testdata/testarchives/evilarchives/evil.tar.bz2",
-	}
-
-	to := "testdata/testarchives/destarchives/"
-
-	for _, archiveName := range testArchives {
-		f, err := ByExtension(archiveName)
-
-		if err != nil {
-			t.Error(err)
-		}
-
-		var target string
-
-		switch v := f.(type) {
-		case *Rar:
-			v.OverwriteExisting = false
-			v.ImplicitTopLevelFolder = false
-			v.StripComponents = 1
-			target = "quote1.txt"
-		case *Zip:
-		case *Tar:
-			v.OverwriteExisting = false
-			v.ImplicitTopLevelFolder = false
-			v.StripComponents = 1
-			target = "safefile"
-		case *TarGz:
-		case *TarBz2:
-			v.Tar.OverwriteExisting = false
-			v.Tar.ImplicitTopLevelFolder = false
-			v.Tar.StripComponents = 1
-			target = "safefile"
-		}
-
-		u := f.(Unarchiver)
-
-		if err := u.Unarchive(archiveName, to); err != nil {
-			fmt.Println(err)
-		}
-
-		if _, err := os.Stat(filepath.Join(to, target)); os.IsNotExist(err) {
-			t.Errorf("file is incorrectly extracted: %s", target)
-		}
-
-		os.RemoveAll(to)
-	}
-}
-
-// test at runtime if the CheckFilename function is behaving properly for the archive formats
-func TestSafeExtraction(t *testing.T) {
-
-	testArchives := []string{
-		"testdata/testarchives/evilarchives/evil.zip",
-		"testdata/testarchives/evilarchives/evil.tar",
-		"testdata/testarchives/evilarchives/evil.tar.gz",
-		"testdata/testarchives/evilarchives/evil.tar.bz2",
-	}
-
-	for _, archiveName := range testArchives {
-
-		expected := true // 'evilfile' should not be extracted outside of destination directory and 'safefile' should be extracted anyway in the destination folder anyway
-
-		if _, err := os.Stat(archiveName); os.IsNotExist(err) {
-			t.Errorf("archive not found")
-		}
-
-		actual := CheckFilenames(archiveName)
-
-		if actual != expected {
-			t.Errorf("CheckFilename is misbehaving for archive format type %s", filepath.Ext(archiveName))
-		}
-	}
-}
-
-func CheckFilenames(archiveName string) bool {
-
-	evilNotExtracted := false // by default we cannot assume that the path traversal filename is mitigated by CheckFilename
-	safeExtracted := false    // by default we cannot assume that a benign file can be extracted successfully
-
-	// clean the destination folder after this test
-	defer os.RemoveAll("testdata/testarchives/destarchives/")
-
-	err := Unarchive(archiveName, "testdata/testarchives/destarchives/")
-	if err != nil {
-		fmt.Println(err)
-	}
-
-	// is 'evilfile' prevented to be extracted outside of the destination folder?
-	if _, err := os.Stat("testdata/testarchives/evilfile"); os.IsNotExist(err) {
-		evilNotExtracted = true
-	}
-	// is 'safefile' safely extracted without errors inside the destination path?
-	if _, err := os.Stat("testdata/testarchives/destarchives/safedir/safefile"); !os.IsNotExist(err) {
-		safeExtracted = true
-	}
-
-	return evilNotExtracted && safeExtracted
-}
-
 var archiveFormats = []interface{}{
 	DefaultZip,
 	DefaultTar,
@@ -587,8 +490,8 @@ var archiveFormats = []interface{}{
 
 type archiverUnarchiver interface {
 	Archiver
+	WriterArchiver
 	Unarchiver
-	ReaderUnarchiver
 }
 
 type fakeFileInfo struct {
